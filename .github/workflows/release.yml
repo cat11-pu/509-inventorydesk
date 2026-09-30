@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: Build Linux
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'ServerMark ${{ github.ref_name }}'
+          releaseBody: |
+            See the [CHANGELOG](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details.
+          releaseDraft: false
+          prerelease: false
+
+      # Tauri/linuxdeploy writes .DirIcon as an absolute symlink to the build
+      # runner's filesystem, which is dangling once the AppImage is downloaded
+      # (the AppImage catalog test rejects it). Repoint it to a relative link.
+      - name: Fix .DirIcon symlink in AppImage
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        working-directory: src-tauri/target/release/bundle/appimage
+        run: |
+          set -euo pipefail
+          APPIMAGE=$(ls ./*.AppImage | head -n 1)
+          chmod +x "$APPIMAGE"
+          "$APPIMAGE" --appimage-extract >/dev/null
+          ICON=$(basename "$(readlink squashfs-root/.DirIcon)")
+          test -f "squashfs-root/$ICON"
+          ln -sfn "$ICON" squashfs-root/.DirIcon
+          # The extracted tree has 700 directories; make it readable and
+          # traversable by other users (the catalog test runs under firejail).
+          chmod -R a+rX,go-w squashfs-root
+          wget -q -O appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          sudo apt-get install -y zsync
+          # Embed update info and generate the .zsync file (AppImageUpdate)
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool \
+            -u "gh-releases-zsync|${{ github.repository_owner }}|servermark|latest|ServerMark_*_amd64.AppImage.zsync" \
+            squashfs-root "$APPIMAGE"
+          gh release upload "${{ github.ref_name }}" "$APPIMAGE" "$APPIMAGE.zsync" --clobber --repo "${{ github.repository }}"
